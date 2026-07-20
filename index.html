@@ -888,7 +888,7 @@ body.login-open {
         </div>
 
         <div class="cloudinary-info">
-          Los archivos que subas desde Happy Moments se guardan en Cloudinary y se agregan a tu galería local.
+          Los archivos que subas desde Happy Moments se guardan en Cloudinary y se registran en Google Sheets para mantener una galería compartida y persistente.
           Al seleccionar uno, su URL se colocará automáticamente en la tarjeta.
         </div>
 
@@ -946,7 +946,7 @@ body.login-open {
 
         <div class="cloudinary-info">
           Aquí puedes ver imágenes y videos, reproducir videos, copiar la URL y usar cualquier archivo directamente en una tarjeta.
-          Los archivos que subas desde Happy Moments se agregan automáticamente a esta galería en este navegador.
+          Los archivos que subas desde Happy Moments se guardan en Cloudinary y su catálogo se sincroniza en Google Sheets para que todos los usuarios vean la misma galería.
         </div>
 
         <div id="mediaGalleryGrid" class="video-grid" style="margin-top:18px"></div>
@@ -1009,8 +1009,7 @@ document.addEventListener("DOMContentLoaded", async function(){
     mostrarAplicacion();
     await cargarPlantillas();
     await cargarContactos();
-  renderVideoteca();
-  renderGaleriaMedia();
+    await cargarGaleriaServidor();
   } else {
     await cargarUsuariosLogin();
   }
@@ -1100,6 +1099,7 @@ async function iniciarSesion(){
       mostrarAplicacion();
       await cargarPlantillas();
       await cargarContactos();
+      await cargarGaleriaServidor();
       return;
     }
 
@@ -1145,28 +1145,49 @@ function cerrarSesion(){
 //////////////////////////////////////////////////
 const CLOUDINARY_CLOUD_NAME = "c0bhiaeq";
 const CLOUDINARY_UPLOAD_PRESET = "HappyMoments";
-const CLOUDINARY_GALLERY_KEY = "happyMomentsCloudinaryGalleryV1";
 
 let cloudinaryWidget = null;
 let archivoGaleriaSeleccionado = null;
+let galeriaServidor = [];
 
+/**
+ * Devuelve la copia en memoria de la galería cargada desde Google Sheets.
+ * Ya no usamos localStorage como fuente principal.
+ */
 function obtenerGaleriaLocal(){
-  try{
-    const raw = localStorage.getItem(CLOUDINARY_GALLERY_KEY);
-    const lista = raw ? JSON.parse(raw) : [];
-    return Array.isArray(lista) ? lista : [];
-  }catch(e){
-    console.warn("No se pudo leer la galería local", e);
-    return [];
-  }
+  return Array.isArray(galeriaServidor) ? galeriaServidor : [];
 }
 
 function guardarGaleriaLocal(lista){
-  localStorage.setItem(CLOUDINARY_GALLERY_KEY, JSON.stringify(lista));
+  galeriaServidor = Array.isArray(lista) ? lista : [];
 }
 
-function registrarArchivoCloudinary(info){
-  const lista = obtenerGaleriaLocal();
+/**
+ * Carga la galería central desde Google Sheets mediante Apps Script.
+ */
+async function cargarGaleriaServidor(){
+  try{
+    const res = await fetch(SCRIPT_URL + "?tipo=galeria&t=" + Date.now(), {cache:"no-store"});
+    if(!res.ok) throw new Error("HTTP " + res.status);
+
+    const data = await res.json();
+    galeriaServidor = Array.isArray(data) ? data : [];
+
+    renderGaleriaMedia();
+    renderVideoteca();
+    recargarGaleriaHappy();
+  }catch(error){
+    console.error("Error cargando galería desde Google Sheets:", error);
+    galeriaServidor = [];
+    renderGaleriaMedia();
+  }
+}
+
+/**
+ * Guarda la referencia del archivo Cloudinary en Google Sheets.
+ * Cloudinary conserva el archivo físico; Sheets conserva el catálogo compartido.
+ */
+async function registrarArchivoCloudinary(info){
   const url = info.secure_url || info.url || "";
   if(!url) return;
 
@@ -1179,13 +1200,31 @@ function registrarArchivoCloudinary(info){
     created_at: info.created_at || new Date().toISOString()
   };
 
-  const sinDuplicado = lista.filter(x => x.secure_url !== item.secure_url);
-  sinDuplicado.unshift(item);
+  try{
+    const res = await fetch(SCRIPT_URL,{
+      method:"POST",
+      headers:{"Content-Type":"text/plain"},
+      body:JSON.stringify({
+        tipoOperacion:"guardarGaleria",
+        nombre:item.original_filename,
+        url:item.secure_url,
+        tipo:item.resource_type,
+        public_id:item.public_id,
+        formato:item.format,
+        fecha:item.created_at
+      })
+    });
 
-  // Mantener hasta 200 referencias recientes en este navegador.
-  guardarGaleriaLocal(sinDuplicado.slice(0, 200));
-  renderVideoteca();
-  renderGaleriaMedia();
+    const data = await res.json();
+    if(data && data.success === false){
+      throw new Error(data.error || "No fue posible guardar la galería");
+    }
+
+    await cargarGaleriaServidor();
+  }catch(error){
+    console.error("Error guardando archivo en la galería central:", error);
+    alert("El archivo se subió a Cloudinary, pero no se pudo registrar en Google Sheets.");
+  }
 }
 
 function abrirCloudinaryUpload(){
@@ -1223,7 +1262,7 @@ function abrirCloudinaryUpload(){
           sourceBg: "#F7F3FB"
         }
       }
-    }, (error, result) => {
+    }, async (error, result) => {
       if(error){
         console.error("Cloudinary Upload Widget:", error);
         return;
@@ -1231,7 +1270,7 @@ function abrirCloudinaryUpload(){
 
       if(result && result.event === "success"){
         const info = result.info || {};
-        registrarArchivoCloudinary(info);
+        await registrarArchivoCloudinary(info);
 
         const input = document.getElementById("urlMedia");
         input.value = info.secure_url || "";
@@ -1315,13 +1354,38 @@ function usarArchivoGaleria(){
   cerrarGaleriaHappy();
 }
 
-function eliminarArchivoGaleriaLocal(index){
+async function eliminarArchivoGaleriaLocal(index){
   const lista = obtenerGaleriaLocal();
-  lista.splice(index, 1);
-  guardarGaleriaLocal(lista);
-  archivoGaleriaSeleccionado = null;
-  document.getElementById("galleryUseButton").disabled = true;
-  recargarGaleriaHappy();
+  const item = lista[index];
+  if(!item) return;
+
+  if(!confirm("¿Quitar este archivo de la galería compartida? El archivo seguirá existiendo en Cloudinary.")){
+    return;
+  }
+
+  try{
+    const res = await fetch(SCRIPT_URL,{
+      method:"POST",
+      headers:{"Content-Type":"text/plain"},
+      body:JSON.stringify({
+        tipoOperacion:"borrarGaleria",
+        public_id:item.public_id || "",
+        url:item.secure_url || ""
+      })
+    });
+
+    const data = await res.json();
+    if(data && data.success === false){
+      throw new Error(data.error || "No fue posible borrar el registro");
+    }
+
+    archivoGaleriaSeleccionado = null;
+    document.getElementById("galleryUseButton").disabled = true;
+    await cargarGaleriaServidor();
+  }catch(error){
+    console.error(error);
+    alert("No fue posible quitar el archivo de la galería.");
+  }
 }
 
 function actualizarVistaPreviaMedia(){
@@ -1422,7 +1486,7 @@ function renderGaleriaMedia(){
   }).join("");
 }
 
-function agregarMediaManual(){
+async function agregarMediaManual(){
   const input = document.getElementById("mediaUrlManual");
   const url = String(input.value || "").trim();
 
@@ -1435,7 +1499,7 @@ function agregarMediaManual(){
     /\.(mp4|mov|webm|avi)(\?.*)?$/i.test(url) ||
     url.includes("/video/upload/");
 
-  registrarArchivoCloudinary({
+  await registrarArchivoCloudinary({
     secure_url: url,
     resource_type: esVideo ? "video" : "image",
     original_filename: esVideo ? "Video agregado manualmente" : "Imagen agregada manualmente",
@@ -1443,7 +1507,6 @@ function agregarMediaManual(){
   });
 
   input.value = "";
-  renderGaleriaMedia();
 }
 
 async function copiarUrlMedia(encodedUrl){
